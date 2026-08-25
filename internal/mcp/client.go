@@ -15,6 +15,11 @@ import (
 
 // Client is an MCP client that connects to an MCP server via HTTP SSE.
 // It implements the MCP client protocol: discover tools, invoke tools.
+
+// sendGraceWindow is how long readSSE waits for msgCh to drain before
+// dropping a message (bounded blocking send — see readSSE).
+const sendGraceWindow = 5 * time.Second
+
 type Client struct {
 	serverURL  string
 	httpClient *http.Client
@@ -23,6 +28,10 @@ type Client struct {
 	connected  bool
 	msgCh      chan json.RawMessage
 	done       chan struct{}
+	// sendTimer is reused across readSSE iterations: allocating a fresh
+	// timer per message (time.After) churns the GC on high-frequency
+	// streams. Guarded by readSSE being the only goroutine that uses it.
+	sendTimer *time.Timer
 }
 
 // NewClient creates a new MCP client that connects to the given server URL.
@@ -141,10 +150,26 @@ func (c *Client) readSSE(body io.ReadCloser) {
 				// channel fills up and no waiter ever arrives. Give each send
 				// a grace window; if it still doesn't fit, drop and log so the
 				// reader keeps draining the HTTP body.
+				//
+				// The timer is reused across messages (Stop+Reset) instead of
+				// time.After, which allocates a fresh timer per message and
+				// keeps unreferenced timers alive until they fire — real GC
+				// pressure on high-frequency streams.
+				if c.sendTimer == nil {
+					c.sendTimer = time.NewTimer(sendGraceWindow)
+				} else {
+					c.sendTimer.Reset(sendGraceWindow)
+				}
 				select {
 				case c.msgCh <- msg:
-				case <-time.After(5 * time.Second):
-					log.Printf("[mcp] msgCh full for session %s, dropping message after 5s wait", c.sessionID)
+					if !c.sendTimer.Stop() {
+						select {
+						case <-c.sendTimer.C:
+						default:
+						}
+					}
+				case <-c.sendTimer.C:
+					log.Printf("[mcp] msgCh full for session %s, dropping message after %v wait", c.sessionID, sendGraceWindow)
 				}
 			}
 		}

@@ -360,7 +360,11 @@ func handleRPC(ctx context.Context, sess *session, req *jsonRPCRequest) *jsonRPC
 			URI string `json:"uri"`
 		}
 		if err := json.Unmarshal(req.Params, &params); err != nil {
-			return newRPCError(req.ID, -32602, "invalid params: "+err.Error())
+			// Consistent with the provider-error handling below: the raw
+			// unmarshal error can echo request bytes / internal shapes, so
+			// log it and return a generic message.
+			log.Printf("[mcp] resources/read: invalid params: %v", err)
+			return newRPCError(req.ID, -32602, "invalid params: uri is required")
 		}
 		if params.URI == "" {
 			return newRPCError(req.ID, -32602, "missing uri")
@@ -376,6 +380,11 @@ func handleRPC(ctx context.Context, sess *session, req *jsonRPCRequest) *jsonRPC
 		// scheme can still point at internal data. Only URIs the provider
 		// itself advertised via resources/list are readable, so reads are
 		// tied to the enumerated surface and cannot probe arbitrary targets.
+		//
+		// TODO(PR follow-up): this is O(n) per read. Fine at current
+		// resource counts; if providers grow large, add a
+		// ResourceExists(ctx, uri) bool method to ResourceProvider so the
+		// check happens inside the provider without materializing the list.
 		listed, err := rp.ListResources(ctx)
 		if err != nil {
 			log.Printf("[mcp] resources/read allowlist check failed: %v", err)
